@@ -105,6 +105,16 @@ class ScreenRecorder(
 
                 override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
                     Log.i(TAG, "Output format changed: $format")
+                    // The encoder reports the H.264 header as two separate pieces:
+                    // csd-0 = SPS, csd-1 = PPS. The MP4 muxer needs exactly these.
+                    val sps = format.getByteBuffer("csd-0")?.let { buf ->
+                        ByteArray(buf.remaining()).also { buf.duplicate().get(it) }
+                    }
+                    val pps = format.getByteBuffer("csd-1")?.let { buf ->
+                        ByteArray(buf.remaining()).also { buf.duplicate().get(it) }
+                    }
+                    ReplayExporter.setCodecConfig(sps, pps)
+                    Log.i(TAG, "Saved codec config: sps=${sps?.size ?: 0} bytes, pps=${pps?.size ?: 0} bytes")
                 }
             }, handler)
 

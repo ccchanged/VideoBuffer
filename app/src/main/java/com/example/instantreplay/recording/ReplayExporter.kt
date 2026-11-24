@@ -25,6 +25,16 @@ object ReplayExporter {
     private const val TAG = "ReplayExporter"
     private const val MIME_TYPE = MediaFormat.MIMETYPE_VIDEO_AVC
 
+    // H.264 header from the encoder's output format (set by ScreenRecorder).
+    @Volatile private var sps: ByteArray? = null
+    @Volatile private var pps: ByteArray? = null
+
+    /** Called by ScreenRecorder when the encoder reports its SPS (csd-0) and PPS (csd-1). */
+    fun setCodecConfig(sps: ByteArray?, pps: ByteArray?) {
+        this.sps = sps
+        this.pps = pps
+    }
+
     /**
      * Export the replay buffer to an MP4 file.
      *
@@ -63,11 +73,20 @@ object ReplayExporter {
         try {
             muxer = MediaMuxer(tempFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
-            // Set up the video track with codec config (SPS/PPS).
-            val codecConfig = NativeBridge.nativeGetExportCodecConfig()
+            // Set up the video track with codec config: SPS as csd-0 and PPS as csd-1.
             val format = MediaFormat.createVideoFormat(MIME_TYPE, width, height)
-            if (codecConfig != null) {
-                format.setByteBuffer("csd-0", ByteBuffer.wrap(codecConfig))
+            val spsBytes = sps
+            val ppsBytes = pps
+            if (spsBytes != null && ppsBytes != null) {
+                format.setByteBuffer("csd-0", ByteBuffer.wrap(spsBytes))
+                format.setByteBuffer("csd-1", ByteBuffer.wrap(ppsBytes))
+            } else {
+                // Fallback: whatever codec config the Rust buffer stored.
+                Log.w(TAG, "No SPS/PPS from encoder format, using buffered codec config")
+                val codecConfig = NativeBridge.nativeGetExportCodecConfig()
+                if (codecConfig != null) {
+                    format.setByteBuffer("csd-0", ByteBuffer.wrap(codecConfig))
+                }
             }
             videoTrack = muxer.addTrack(format)
             muxer.start()
@@ -102,17 +121,20 @@ object ReplayExporter {
                 muxer.writeSampleData(videoTrack, ByteBuffer.wrap(data), bufferInfo)
             }
 
+            // Finalize the file. Only count the export as successful if this works.
+            muxer.stop()
+            muxer.release()
+            muxer = null
+
             success = true
             Log.i(TAG, "Export complete: $fileName")
         } catch (e: Exception) {
             Log.e(TAG, "Export failed", e)
         } finally {
             try {
-                muxer?.stop()
                 muxer?.release()
             } catch (e: Exception) {
-                Log.w(TAG, "Error finalizing muxer", e)
-                success = false
+                Log.w(TAG, "Error releasing muxer", e)
             }
             NativeBridge.nativeEndExport()
         }
