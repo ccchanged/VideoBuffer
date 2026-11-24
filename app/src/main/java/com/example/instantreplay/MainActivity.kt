@@ -43,6 +43,7 @@ class MainActivity : ComponentActivity() {
     private var exportMessage = mutableStateOf<String?>(null)
     private var showSettings = mutableStateOf(false)
     private var settings = mutableStateOf(RecordingSettings())
+    private var regularLogging = mutableStateOf(false)
     private var debugLogging = mutableStateOf(false)
 
     // Service binding.
@@ -91,6 +92,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         loadSettings()
+        regularLogging.value = DebugLogger.isRegularEnabled
         debugLogging.value = DebugLogger.isEnabled
 
         setContent {
@@ -101,16 +103,23 @@ class MainActivity : ComponentActivity() {
                 val message by exportMessage
                 val settingsVisible by showSettings
                 val currentSettings by settings
+                val regularEnabled by regularLogging
                 val debugEnabled by debugLogging
 
                 if (settingsVisible) {
                     SettingsScreen(
                         settings = currentSettings,
                         isRecording = recording,
+                        regularLogging = regularEnabled,
                         debugLogging = debugEnabled,
                         onSettingsChanged = { newSettings ->
                             settings.value = newSettings
                             saveSettings(newSettings)
+                        },
+                        onRegularLoggingChanged = { enabled ->
+                            regularLogging.value = enabled
+                            if (!enabled) debugLogging.value = false
+                            DebugLogger.setRegularEnabled(this@MainActivity, enabled)
                         },
                         onDebugLoggingChanged = { enabled ->
                             debugLogging.value = enabled

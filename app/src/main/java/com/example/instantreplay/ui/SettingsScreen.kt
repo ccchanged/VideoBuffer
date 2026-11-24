@@ -50,8 +50,10 @@ data class RecordingSettings(
 fun SettingsScreen(
     settings: RecordingSettings,
     isRecording: Boolean,
+    regularLogging: Boolean,
     debugLogging: Boolean,
     onSettingsChanged: (RecordingSettings) -> Unit,
+    onRegularLoggingChanged: (Boolean) -> Unit,
     onDebugLoggingChanged: (Boolean) -> Unit,
     onBack: () -> Unit,
 ) {
@@ -143,13 +145,39 @@ fun SettingsScreen(
             HorizontalDivider()
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Debug logging toggle.
+            // Logging toggles.
             Text(
-                text = "Debug",
+                text = "Logging",
                 style = MaterialTheme.typography.titleSmall,
                 modifier = Modifier.padding(bottom = 8.dp),
             )
 
+            // Regular logging.
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Regular Logging",
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                    Text(
+                        text = "Save info, warning and error logs to a text file in Downloads/InstantReplay.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = regularLogging,
+                    onCheckedChange = onRegularLoggingChanged,
+                )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Debug logging (only available while regular logging is on).
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -161,14 +189,15 @@ fun SettingsScreen(
                         style = MaterialTheme.typography.bodyLarge,
                     )
                     Text(
-                        text = "Write verbose logs to logcat for debugging. Use: adb logcat -s ReplayCore:V ScreenRecorder:V",
+                        text = "Also save debug logs to the same file. Turn on Regular Logging first.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 Switch(
-                    checked = debugLogging,
+                    checked = debugLogging && regularLogging,
                     onCheckedChange = onDebugLoggingChanged,
+                    enabled = regularLogging,
                 )
             }
 
