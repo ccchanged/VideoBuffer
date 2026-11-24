@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Instant Replay</string>
+    <string name="notification_channel_name">Screen Recording</string>
+    <string name="notification_channel_description">Ongoing notification while screen is being recorded</string>
+    <string name="notification_title">Instant Replay</string>
+    <string name="notification_text">Recording screen…</string>
+    <string name="save_replay">Save Replay</string>
+    <string name="start_recording">Start Recording</string>
+    <string name="stop_recording">Stop Recording</string>
+    <string name="settings">Settings</string>
+    <string name="resolution">Resolution</string>
+    <string name="fps">Frame Rate</string>
+    <string name="bitrate">Video Bitrate</string>
+    <string name="replay_duration">Replay Duration</string>
+    <string name="recording_idle">Not Recording</string>
+    <string name="recording_active">Recording</string>
+    <string name="recording_error">Recording Error</string>
+    <string name="exporting">Exporting…</string>
+    <string name="export_complete">Replay saved!</string>
+    <string name="export_failed">Export failed</string>
+    <string name="buffer_empty">Buffer is empty</string>
+    <string name="seconds_abbrev">%ds</string>
+</resources>
