@@ -1,1 +1,0 @@
-*mut jni_sys::_jobject: AsRef<JPrimitiveArray<'_, i8>>
