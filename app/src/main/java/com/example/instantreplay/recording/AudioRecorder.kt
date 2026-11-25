@@ -37,6 +37,9 @@ class AudioRecorder(
     private var callbackThread: HandlerThread? = null
     @Volatile private var isRecording = false
 
+    // Free input buffer indices handed to us by the encoder's async callback.
+    private val inputBufferQueue = java.util.concurrent.LinkedBlockingQueue<Int>()
+
     var onError: ((Exception) -> Unit)? = null
 
     @SuppressLint("MissingPermission")
@@ -91,7 +94,7 @@ class AudioRecorder(
 
             codec.setCallback(object : MediaCodec.Callback() {
                 override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
-                    // Fed in recordThread
+                    inputBufferQueue.offer(index)
                 }
 
                 override fun onOutputBufferAvailable(
@@ -152,7 +155,7 @@ class AudioRecorder(
                     if (readBytes > 0) {
                         val presentationTimeUs = System.nanoTime() / 1000
                         try {
-                            val inputIndex = codec.dequeueInputBuffer(10_000)
+                            val inputIndex = inputBufferQueue.poll(50, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
                             if (inputIndex >= 0) {
                                 val inputBuffer = codec.getInputBuffer(inputIndex)
                                 inputBuffer?.clear()

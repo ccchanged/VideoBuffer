@@ -112,42 +112,69 @@ object ReplayExporter {
 
             muxer.start()
 
-            val outInfo = LongArray(2) // [presentationTimeUs, flags]
             val bufferInfo = MediaCodec.BufferInfo()
 
-            // 3. Write video frames
-            for (i in 0 until frameCount) {
-                val data = NativeBridge.nativeGetExportFrame(i, outInfo)
-                if (data == null) {
-                    Log.w(TAG, "Null video frame at index $i, stopping video write")
-                    break
-                }
+            // 3. Write video and audio frames interleaved, in order of presentation time.
+            val videoInfo = LongArray(2) // [presentationTimeUs, flags] of the pending video frame
+            val audioInfo = LongArray(2) // [presentationTimeUs, flags] of the pending audio frame
+            var videoIndex = 0
+            var audioIndex = 0
 
-                val flags = outInfo[1].toInt()
-                if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                    continue
-                }
-
-                bufferInfo.set(0, data.size, outInfo[0], flags)
-                muxer.writeSampleData(videoTrack, ByteBuffer.wrap(data), bufferInfo)
-            }
-
-            // 4. Write audio frames if available
-            if (audioTrack >= 0) {
-                for (i in 0 until audioFrameCount) {
-                    val data = NativeBridge.nativeGetExportAudioFrame(i, outInfo)
+            // Loads the next video sample (skipping codec config), or null when finished.
+            fun loadVideo(): ByteArray? {
+                while (videoIndex < frameCount) {
+                    val i = videoIndex++
+                    val data = NativeBridge.nativeGetExportFrame(i, videoInfo)
                     if (data == null) {
-                        Log.w(TAG, "Null audio frame at index $i, stopping audio write")
-                        break
+                        Log.w(TAG, "Null video frame at index $i, stopping video write")
+                        videoIndex = frameCount
+                        return null
                     }
-
-                    val flags = outInfo[1].toInt()
-                    if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                    if (videoInfo[1].toInt() and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
                         continue
                     }
+                    return data
+                }
+                return null
+            }
 
-                    bufferInfo.set(0, data.size, outInfo[0], flags)
+            // Loads the next audio sample (skipping codec config), or null when finished.
+            fun loadAudio(): ByteArray? {
+                if (audioTrack < 0) return null
+                while (audioIndex < audioFrameCount) {
+                    val i = audioIndex++
+                    val data = NativeBridge.nativeGetExportAudioFrame(i, audioInfo)
+                    if (data == null) {
+                        Log.w(TAG, "Null audio frame at index $i, stopping audio write")
+                        audioIndex = audioFrameCount
+                        return null
+                    }
+                    if (audioInfo[1].toInt() and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                        continue
+                    }
+                    return data
+                }
+                return null
+            }
+
+            var videoData = loadVideo()
+            var audioData = loadAudio()
+
+            while (videoData != null || audioData != null) {
+                // Write whichever pending sample comes first in time.
+                val writeVideo = audioData == null ||
+                    (videoData != null && videoInfo[0] <= audioInfo[0])
+
+                if (writeVideo) {
+                    val data = videoData!!
+                    bufferInfo.set(0, data.size, videoInfo[0], videoInfo[1].toInt())
+                    muxer.writeSampleData(videoTrack, ByteBuffer.wrap(data), bufferInfo)
+                    videoData = loadVideo()
+                } else {
+                    val data = audioData!!
+                    bufferInfo.set(0, data.size, audioInfo[0], audioInfo[1].toInt())
                     muxer.writeSampleData(audioTrack, ByteBuffer.wrap(data), bufferInfo)
+                    audioData = loadAudio()
                 }
             }
 
