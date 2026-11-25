@@ -18,8 +18,8 @@ import java.util.Locale
 /**
  * Exports the current buffer snapshot to an MP4 file using MediaMuxer.
  *
- * Reads frames from the Rust export snapshot and muxes them into a file saved
- * to the device's Movies directory.
+ * Reads video and audio frames from the Rust export snapshot and muxes them into
+ * a synchronized file saved to the device's Movies directory.
  */
 object ReplayExporter {
     private const val TAG = "ReplayExporter"
@@ -29,10 +29,18 @@ object ReplayExporter {
     @Volatile private var sps: ByteArray? = null
     @Volatile private var pps: ByteArray? = null
 
+    // AAC header from the audio encoder's output format (set by AudioRecorder).
+    @Volatile private var audioCsd0: ByteArray? = null
+
     /** Called by ScreenRecorder when the encoder reports its SPS (csd-0) and PPS (csd-1). */
     fun setCodecConfig(sps: ByteArray?, pps: ByteArray?) {
         this.sps = sps
         this.pps = pps
+    }
+
+    /** Called by AudioRecorder when the audio encoder reports its ASC (csd-0). */
+    fun setAudioCodecConfig(csd0: ByteArray?) {
+        this.audioCsd0 = csd0
     }
 
     /**
@@ -55,11 +63,12 @@ object ReplayExporter {
     ): String? {
         val frameCount = NativeBridge.nativeBeginExport(durationSec)
         if (frameCount <= 0) {
-            Log.w(TAG, "No frames to export")
+            Log.w(TAG, "No video frames to export")
             return null
         }
 
-        Log.i(TAG, "Exporting $frameCount frames")
+        val audioFrameCount = NativeBridge.nativeGetExportAudioFrameCount()
+        Log.i(TAG, "Exporting $frameCount video frames, $audioFrameCount audio frames")
 
         // Create a temporary file first, then copy to MediaStore on success.
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -68,12 +77,13 @@ object ReplayExporter {
 
         var muxer: MediaMuxer? = null
         var videoTrack = -1
+        var audioTrack = -1
         var success = false
 
         try {
             muxer = MediaMuxer(tempFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
-            // Set up the video track with codec config: SPS as csd-0 and PPS as csd-1.
+            // 1. Set up video track: SPS as csd-0 and PPS as csd-1.
             val format = MediaFormat.createVideoFormat(MIME_TYPE, width, height)
             val spsBytes = sps
             val ppsBytes = pps
@@ -81,7 +91,6 @@ object ReplayExporter {
                 format.setByteBuffer("csd-0", ByteBuffer.wrap(spsBytes))
                 format.setByteBuffer("csd-1", ByteBuffer.wrap(ppsBytes))
             } else {
-                // Fallback: whatever codec config the Rust buffer stored.
                 Log.w(TAG, "No SPS/PPS from encoder format, using buffered codec config")
                 val codecConfig = NativeBridge.nativeGetExportCodecConfig()
                 if (codecConfig != null) {
@@ -89,45 +98,66 @@ object ReplayExporter {
                 }
             }
             videoTrack = muxer.addTrack(format)
+
+            // 2. Set up audio track if audio frames are present.
+            if (audioFrameCount > 0) {
+                val audioFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, 44100, 2)
+                val csd0 = audioCsd0 ?: NativeBridge.nativeGetExportAudioCodecConfig()
+                if (csd0 != null) {
+                    audioFormat.setByteBuffer("csd-0", ByteBuffer.wrap(csd0))
+                }
+                audioTrack = muxer.addTrack(audioFormat)
+                Log.i(TAG, "Added audio track to muxer")
+            }
+
             muxer.start()
 
-            // Write each frame.
             val outInfo = LongArray(2) // [presentationTimeUs, flags]
             val bufferInfo = MediaCodec.BufferInfo()
 
+            // 3. Write video frames
             for (i in 0 until frameCount) {
                 val data = NativeBridge.nativeGetExportFrame(i, outInfo)
                 if (data == null) {
-                    Log.w(TAG, "Null frame at index $i, stopping export")
+                    Log.w(TAG, "Null video frame at index $i, stopping video write")
                     break
                 }
 
-                bufferInfo.apply {
-                    offset = 0
-                    size = data.size
-                    presentationTimeUs = outInfo[0]
-                    flags = outInfo[1].toInt()
-                    // Don't pass codec config flag to muxer — it's already in the format.
-                    if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                        return@apply
-                    }
-                }
-
-                // Skip codec config frames (already set up in format).
-                if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                val flags = outInfo[1].toInt()
+                if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
                     continue
                 }
 
+                bufferInfo.set(0, data.size, outInfo[0], flags)
                 muxer.writeSampleData(videoTrack, ByteBuffer.wrap(data), bufferInfo)
             }
 
-            // Finalize the file. Only count the export as successful if this works.
+            // 4. Write audio frames if available
+            if (audioTrack >= 0) {
+                for (i in 0 until audioFrameCount) {
+                    val data = NativeBridge.nativeGetExportAudioFrame(i, outInfo)
+                    if (data == null) {
+                        Log.w(TAG, "Null audio frame at index $i, stopping audio write")
+                        break
+                    }
+
+                    val flags = outInfo[1].toInt()
+                    if (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                        continue
+                    }
+
+                    bufferInfo.set(0, data.size, outInfo[0], flags)
+                    muxer.writeSampleData(audioTrack, ByteBuffer.wrap(data), bufferInfo)
+                }
+            }
+
+            // Finalize the file.
             muxer.stop()
             muxer.release()
             muxer = null
 
             success = true
-            Log.i(TAG, "Export complete: $fileName")
+            Log.i(TAG, "Export complete: $fileName (audio included: ${audioTrack >= 0})")
         } catch (e: Exception) {
             Log.e(TAG, "Export failed", e)
         } finally {

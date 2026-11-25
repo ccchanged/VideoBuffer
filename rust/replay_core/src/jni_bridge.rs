@@ -65,7 +65,7 @@ pub extern "system" fn Java_com_example_instantreplay_bridge_NativeBridge_native
     *guard = Some(RollingBuffer::new(config));
 }
 
-/// Push an encoded frame into the rolling buffer.
+/// Push an encoded video frame into the rolling buffer.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_example_instantreplay_bridge_NativeBridge_nativePushFrame(
     env: JNIEnv,
@@ -85,6 +85,28 @@ pub extern "system" fn Java_com_example_instantreplay_bridge_NativeBridge_native
 
     with_buffer(|buf| {
         buf.push_frame(data_vec, presentation_time_us, flags as u32);
+    });
+}
+
+/// Push an encoded audio frame (AAC) into the rolling buffer.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_example_instantreplay_bridge_NativeBridge_nativePushAudioFrame(
+    env: JNIEnv,
+    _class: JClass,
+    data: JByteArray,
+    presentation_time_us: jlong,
+    flags: jint,
+) {
+    let data_vec = match env.convert_byte_array(&data) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("Failed to convert audio byte array: {}", e);
+            return;
+        }
+    };
+
+    with_buffer(|buf| {
+        buf.push_audio_frame(data_vec, presentation_time_us, flags as u32);
     });
 }
 
@@ -127,7 +149,7 @@ pub extern "system" fn Java_com_example_instantreplay_bridge_NativeBridge_native
     result.into_raw()
 }
 
-/// Begin an export: snapshot the buffer and return the number of frames.
+/// Begin an export: snapshot the buffer and return the number of video frames.
 ///
 /// Returns -1 if the buffer is empty or not initialized.
 #[unsafe(no_mangle)]
@@ -136,7 +158,6 @@ pub extern "system" fn Java_com_example_instantreplay_bridge_NativeBridge_native
     _class: JClass,
     duration_sec: jint,
 ) -> jint {
-    // Can't use with_buffer here because ExportSnapshot doesn't impl Default.
     let mut guard = BUFFER.lock().unwrap();
     let buf = match guard.as_mut() {
         Some(b) => b,
@@ -149,18 +170,22 @@ pub extern "system" fn Java_com_example_instantreplay_bridge_NativeBridge_native
     let snapshot = buf.snapshot_for_export(duration_sec);
     let frame_count = snapshot.total_frames();
     if frame_count == 0 {
-        log::warn!("Export requested but buffer is empty");
+        log::warn!("Export requested but buffer has no video frames");
         return -1;
     }
 
-    log::info!("Export started: {} frames", frame_count);
+    log::info!(
+        "Export started: {} video frames, {} audio frames",
+        frame_count,
+        snapshot.total_audio_frames()
+    );
     let mut export_guard = EXPORT.lock().unwrap();
     *export_guard = Some(snapshot);
 
     frame_count as jint
 }
 
-/// Get a single export frame by index.
+/// Get a single export video frame by index.
 ///
 /// `out_info` is a long array of length 2: [presentationTimeUs, flags].
 /// Returns the frame data as a byte array, or null if index is out of bounds.
@@ -182,14 +207,12 @@ pub extern "system" fn Java_com_example_instantreplay_bridge_NativeBridge_native
 
     match snapshot.get_frame(index as usize) {
         Some((data, pts_us, flags)) => {
-            // Write frame metadata to out_info.
             let info = [pts_us, flags as i64];
             if let Err(e) = env.set_long_array_region(&out_info, 0, &info) {
                 log::error!("Failed to write out_info: {}", e);
                 return std::ptr::null_mut();
             }
 
-            // Return frame data as byte array.
             match env.byte_array_from_slice(data) {
                 Ok(arr) => arr.into_raw(),
                 Err(e) => {
@@ -205,9 +228,7 @@ pub extern "system" fn Java_com_example_instantreplay_bridge_NativeBridge_native
     }
 }
 
-/// Get the codec config data (SPS/PPS) for the export.
-///
-/// Returns null if no codec config is available.
+/// Get the video codec config data (SPS/PPS) for the export.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_example_instantreplay_bridge_NativeBridge_nativeGetExportCodecConfig(
     env: JNIEnv,
@@ -234,6 +255,88 @@ pub extern "system" fn Java_com_example_instantreplay_bridge_NativeBridge_native
             log::warn!("No codec config available");
             std::ptr::null_mut()
         }
+    }
+}
+
+/// Get the number of audio frames in the active export snapshot.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_example_instantreplay_bridge_NativeBridge_nativeGetExportAudioFrameCount(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    let export_guard = EXPORT.lock().unwrap();
+    match export_guard.as_ref() {
+        Some(s) => s.total_audio_frames() as jint,
+        None => 0,
+    }
+}
+
+/// Get a single export audio frame by index.
+///
+/// `out_info` is a long array of length 2: [presentationTimeUs, flags].
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_example_instantreplay_bridge_NativeBridge_nativeGetExportAudioFrame(
+    env: JNIEnv,
+    _class: JClass,
+    index: jint,
+    out_info: JLongArray,
+) -> jbyteArray {
+    let export_guard = EXPORT.lock().unwrap();
+    let snapshot = match export_guard.as_ref() {
+        Some(s) => s,
+        None => {
+            log::error!("No active export");
+            return std::ptr::null_mut();
+        }
+    };
+
+    match snapshot.get_audio_frame(index as usize) {
+        Some((data, pts_us, flags)) => {
+            let info = [pts_us, flags as i64];
+            if let Err(e) = env.set_long_array_region(&out_info, 0, &info) {
+                log::error!("Failed to write audio out_info: {}", e);
+                return std::ptr::null_mut();
+            }
+
+            match env.byte_array_from_slice(data) {
+                Ok(arr) => arr.into_raw(),
+                Err(e) => {
+                    log::error!("Failed to create audio byte array: {}", e);
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        None => {
+            log::warn!("Export audio frame index {} out of bounds", index);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Get the audio codec config data (AAC AudioSpecificConfig / csd-0).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_example_instantreplay_bridge_NativeBridge_nativeGetExportAudioCodecConfig(
+    env: JNIEnv,
+    _class: JClass,
+) -> jbyteArray {
+    let export_guard = EXPORT.lock().unwrap();
+    let snapshot = match export_guard.as_ref() {
+        Some(s) => s,
+        None => {
+            log::error!("No active export");
+            return std::ptr::null_mut();
+        }
+    };
+
+    match snapshot.audio_codec_config() {
+        Some(data) => match env.byte_array_from_slice(data) {
+            Ok(arr) => arr.into_raw(),
+            Err(e) => {
+                log::error!("Failed to create audio codec config byte array: {}", e);
+                std::ptr::null_mut()
+            }
+        },
+        None => std::ptr::null_mut(),
     }
 }
 

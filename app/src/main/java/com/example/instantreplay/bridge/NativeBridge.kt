@@ -20,6 +20,10 @@ object NativeBridge {
     @JvmStatic
     external fun nativePushFrame(data: ByteArray, presentationTimeUs: Long, flags: Int)
 
+    /** Push an encoded audio frame (AAC from MediaCodec output). */
+    @JvmStatic
+    external fun nativePushAudioFrame(data: ByteArray, presentationTimeUs: Long, flags: Int)
+
     /** Get the current buffer duration in milliseconds. */
     @JvmStatic
     external fun nativeGetBufferDurationMs(): Long
@@ -33,23 +37,39 @@ object NativeBridge {
     external fun nativeGetBufferStatus(): IntArray
 
     /**
-     * Begin an export: snapshot the buffer and return the frame count.
+     * Begin an export: snapshot the buffer and return the video frame count.
      * Returns -1 if the buffer is empty.
      */
     @JvmStatic
     external fun nativeBeginExport(durationSec: Int): Int
 
     /**
-     * Get a single export frame by index.
+     * Get a single export video frame by index.
      * [outInfo] must be a LongArray of size 2 — filled with [presentationTimeUs, flags].
      * Returns the frame data, or null if index is out of range.
      */
     @JvmStatic
     external fun nativeGetExportFrame(index: Int, outInfo: LongArray): ByteArray?
 
-    /** Get the codec config data (SPS/PPS) for the export. Null if unavailable. */
+    /** Get the video codec config data (SPS/PPS) for the export. Null if unavailable. */
     @JvmStatic
     external fun nativeGetExportCodecConfig(): ByteArray?
+
+    /** Get the number of audio frames in the active export snapshot. */
+    @JvmStatic
+    external fun nativeGetExportAudioFrameCount(): Int
+
+    /**
+     * Get a single export audio frame by index.
+     * [outInfo] must be a LongArray of size 2 — filled with [presentationTimeUs, flags].
+     * Returns the audio frame data, or null if index is out of range.
+     */
+    @JvmStatic
+    external fun nativeGetExportAudioFrame(index: Int, outInfo: LongArray): ByteArray?
+
+    /** Get the audio codec config data (AAC AudioSpecificConfig) for the export. Null if unavailable. */
+    @JvmStatic
+    external fun nativeGetExportAudioCodecConfig(): ByteArray?
 
     /** End the current export and free the snapshot. */
     @JvmStatic

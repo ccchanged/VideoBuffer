@@ -110,10 +110,15 @@ fun MainScreen(
             // Start / Stop recording button.
             OutlinedButton(
                 onClick = if (isRecording) onStopRecording else onStartRecording,
+                enabled = !isExporting,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(
-                    text = if (isRecording) "Stop Recording" else "Start Recording",
+                    text = if (isRecording) {
+                        if (isExporting) "Saving replay…" else "Stop Recording"
+                    } else {
+                        "Start Recording"
+                    },
                     fontSize = 16.sp,
                 )
             }

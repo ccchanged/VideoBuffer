@@ -50,9 +50,11 @@ data class RecordingSettings(
 fun SettingsScreen(
     settings: RecordingSettings,
     isRecording: Boolean,
+    internalAudio: Boolean,
     regularLogging: Boolean,
     debugLogging: Boolean,
     onSettingsChanged: (RecordingSettings) -> Unit,
+    onInternalAudioChanged: (Boolean) -> Unit,
     onRegularLoggingChanged: (Boolean) -> Unit,
     onDebugLoggingChanged: (Boolean) -> Unit,
     onBack: () -> Unit,
@@ -140,6 +142,41 @@ fun SettingsScreen(
                     onSettingsChanged(current)
                 },
             )
+
+            Spacer(modifier = Modifier.height(24.dp))
+            HorizontalDivider()
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Audio settings.
+            Text(
+                text = "Audio",
+                style = MaterialTheme.typography.titleSmall,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+
+            // Internal Audio switch.
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Internal Audio",
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                    Text(
+                        text = "Records the Internal Audio while Buffering.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = internalAudio,
+                    onCheckedChange = onInternalAudioChanged,
+                    enabled = !isRecording,
+                )
+            }
 
             Spacer(modifier = Modifier.height(24.dp))
             HorizontalDivider()

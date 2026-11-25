@@ -25,7 +25,7 @@ pub struct BufferStatus {
     pub total_bytes: usize,
 }
 
-/// The core rolling buffer that stores recent encoded video segments.
+/// The core rolling buffer that stores recent encoded video segments and audio frames.
 pub struct RollingBuffer {
     /// Configuration (max duration, etc.).
     config: Config,
@@ -33,12 +33,18 @@ pub struct RollingBuffer {
     segments: VecDeque<Segment>,
     /// Segment currently accumulating frames.
     current_segment: Option<Segment>,
-    /// Codec-specific configuration data (SPS/PPS for H.264).
+    /// Video codec-specific configuration data (SPS/PPS for H.264).
     codec_config: Option<Vec<u8>>,
+    /// Audio frames in the rolling buffer, oldest first.
+    audio_frames: VecDeque<EncodedFrame>,
+    /// Audio codec-specific configuration data (AAC AudioSpecificConfig / csd-0).
+    audio_codec_config: Option<Vec<u8>>,
     /// Current state.
     state: BufferState,
-    /// Total encoded bytes across all sealed segments.
+    /// Total encoded bytes across all sealed video segments.
     sealed_bytes: usize,
+    /// Total encoded bytes of all stored audio frames.
+    audio_bytes: usize,
     /// Timestamp of the last frame pushed (for liveness checking).
     last_frame_time_us: i64,
 }
@@ -51,13 +57,16 @@ impl RollingBuffer {
             segments: VecDeque::new(),
             current_segment: None,
             codec_config: None,
+            audio_frames: VecDeque::new(),
+            audio_codec_config: None,
             state: BufferState::Idle,
             sealed_bytes: 0,
+            audio_bytes: 0,
             last_frame_time_us: 0,
         }
     }
 
-    /// Push an encoded frame into the buffer.
+    /// Push an encoded video frame into the buffer.
     ///
     /// Codec config frames (SPS/PPS) are stored separately and not added to segments.
     /// Keyframes seal the current segment and start a new one.
@@ -95,6 +104,26 @@ impl RollingBuffer {
         }
     }
 
+    /// Push an encoded audio frame (AAC) into the rolling buffer.
+    pub fn push_audio_frame(&mut self, data: Vec<u8>, pts_us: i64, flags: u32) {
+        let frame = EncodedFrame::new(data, pts_us, flags);
+
+        // Codec config (AAC AudioSpecificConfig) — store separately.
+        if frame.is_codec_config() {
+            self.audio_codec_config = Some(frame.data);
+            return;
+        }
+
+        if frame.is_end_of_stream() {
+            return;
+        }
+
+        self.audio_bytes += frame.byte_size();
+        self.audio_frames.push_back(frame);
+
+        self.prune_audio();
+    }
+
     /// Seal the current segment and push it to the sealed queue.
     fn seal_current_segment(&mut self) {
         if let Some(seg) = self.current_segment.take() {
@@ -105,11 +134,36 @@ impl RollingBuffer {
         }
     }
 
-    /// Remove oldest sealed segments until total duration is within the limit.
+    /// Remove oldest sealed segments until total duration is within the limit,
+    /// and prune outdated audio frames.
     fn prune(&mut self) {
         while self.sealed_duration_us() > self.config.max_duration_us {
             if let Some(removed) = self.segments.pop_front() {
                 self.sealed_bytes -= removed.total_bytes;
+            } else {
+                break;
+            }
+        }
+        self.prune_audio();
+    }
+
+    /// Discard audio frames older than the oldest buffered video segment.
+    fn prune_audio(&mut self) {
+        let cutoff = if let Some(first_seg) = self.segments.front() {
+            first_seg.start_pts_us
+        } else if let Some(cur) = &self.current_segment {
+            cur.start_pts_us
+        } else if let Some(last_audio) = self.audio_frames.back() {
+            last_audio.pts_us - self.config.max_duration_us
+        } else {
+            0
+        };
+
+        while let Some(front) = self.audio_frames.front() {
+            if front.pts_us < cutoff {
+                if let Some(removed) = self.audio_frames.pop_front() {
+                    self.audio_bytes -= removed.byte_size();
+                }
             } else {
                 break;
             }
@@ -135,8 +189,6 @@ impl RollingBuffer {
             .map(|s| s.duration_us())
             .unwrap_or(0);
 
-        // If we have sealed segments and a current segment, duration spans from
-        // the oldest sealed segment start to the current segment's latest frame.
         let total = if !self.segments.is_empty() {
             if let Some(cur) = &self.current_segment {
                 let first_start = self.segments.front().unwrap().start_pts_us;
@@ -160,7 +212,8 @@ impl RollingBuffer {
                 .current_segment
                 .as_ref()
                 .map(|s| s.total_bytes)
-                .unwrap_or(0);
+                .unwrap_or(0)
+            + self.audio_bytes;
         BufferStatus {
             state: self.state,
             duration_ms: self.buffer_duration_ms(),
@@ -169,9 +222,14 @@ impl RollingBuffer {
         }
     }
 
-    /// Get the codec config data (SPS/PPS).
+    /// Get the video codec config data (SPS/PPS).
     pub fn codec_config(&self) -> Option<&[u8]> {
         self.codec_config.as_deref()
+    }
+
+    /// Get the audio codec config data (AAC AudioSpecificConfig).
+    pub fn audio_codec_config(&self) -> Option<&[u8]> {
+        self.audio_codec_config.as_deref()
     }
 
     /// Get the current state.
@@ -197,24 +255,26 @@ impl RollingBuffer {
 
     /// Create a snapshot of the buffer for export.
     ///
-    /// This clones all segments covering at most `duration_sec` seconds of the
-    /// most recent footage. The buffer continues to accept new frames normally.
+    /// This clones all video segments and synchronized audio frames covering at most
+    /// `duration_sec` seconds of the most recent footage. The buffer continues to accept new frames.
     pub fn snapshot_for_export(&mut self, duration_sec: i32) -> ExportSnapshot {
         // Seal the current segment so its frames are included in the snapshot.
-        // A new segment will start when the next keyframe arrives.
         self.seal_current_segment();
 
         let duration_us = duration_sec as i64 * 1_000_000;
         let codec_config = self.codec_config.clone();
+        let audio_codec_config = self.audio_codec_config.clone();
 
         if self.segments.is_empty() {
             return ExportSnapshot {
                 segments: Vec::new(),
                 codec_config,
+                audio_frames: Vec::new(),
+                audio_codec_config,
             };
         }
 
-        // Find the cutoff: we want segments whose start_pts >= (latest_end - duration).
+        // Find the cutoff: we want segments whose end_pts >= (latest_end - duration).
         let latest_end = self.segments.back().unwrap().end_pts_us;
         let cutoff = latest_end - duration_us;
 
@@ -225,6 +285,15 @@ impl RollingBuffer {
             .cloned()
             .collect();
 
+        // Audio frames: align with the start of the first included video segment.
+        let base_pts = segments.first().map(|s| s.start_pts_us).unwrap_or(0);
+        let audio_frames: Vec<EncodedFrame> = self
+            .audio_frames
+            .iter()
+            .filter(|frame| frame.pts_us >= base_pts && frame.pts_us <= latest_end)
+            .cloned()
+            .collect();
+
         if self.state == BufferState::Recording {
             self.state = BufferState::Exporting;
         }
@@ -232,6 +301,8 @@ impl RollingBuffer {
         ExportSnapshot {
             segments,
             codec_config,
+            audio_frames,
+            audio_codec_config,
         }
     }
 
@@ -248,23 +319,31 @@ impl RollingBuffer {
         self.current_segment = None;
         self.sealed_bytes = 0;
         self.last_frame_time_us = 0;
+        self.audio_frames.clear();
+        self.audio_bytes = 0;
     }
 }
 
-/// A snapshot of buffer segments for export. Ownership is transferred to the
-/// export process; the buffer can continue recording independently.
+/// A snapshot of buffer segments and audio frames for export.
 pub struct ExportSnapshot {
     pub segments: Vec<Segment>,
     pub codec_config: Option<Vec<u8>>,
+    pub audio_frames: Vec<EncodedFrame>,
+    pub audio_codec_config: Option<Vec<u8>>,
 }
 
 impl ExportSnapshot {
-    /// Total number of frames across all segments.
+    /// Total number of video frames across all segments.
     pub fn total_frames(&self) -> usize {
         self.segments.iter().map(|s| s.frame_count()).sum()
     }
 
-    /// Get a frame by flat index across all segments.
+    /// Total number of audio frames in the snapshot.
+    pub fn total_audio_frames(&self) -> usize {
+        self.audio_frames.len()
+    }
+
+    /// Get a video frame by flat index across all segments.
     ///
     /// Returns (data, adjusted_pts_us, flags) where pts is adjusted to start from 0.
     pub fn get_frame(&self, index: usize) -> Option<(&[u8], i64, u32)> {
@@ -286,9 +365,30 @@ impl ExportSnapshot {
         None
     }
 
-    /// Get the codec config data.
+    /// Get an audio frame by flat index.
+    ///
+    /// Returns (data, adjusted_pts_us, flags) where pts is adjusted to start from the same base as video.
+    pub fn get_audio_frame(&self, index: usize) -> Option<(&[u8], i64, u32)> {
+        let base_pts = self
+            .segments
+            .first()
+            .map(|s| s.start_pts_us)
+            .unwrap_or(0);
+
+        self.audio_frames.get(index).map(|frame| {
+            let adjusted_pts = frame.pts_us - base_pts;
+            (&frame.data[..], adjusted_pts, frame.flags)
+        })
+    }
+
+    /// Get the video codec config data.
     pub fn codec_config(&self) -> Option<&[u8]> {
         self.codec_config.as_deref()
+    }
+
+    /// Get the audio codec config data.
+    pub fn audio_codec_config(&self) -> Option<&[u8]> {
+        self.audio_codec_config.as_deref()
     }
 }
 
@@ -303,6 +403,10 @@ mod tests {
 
     fn push_regular(buf: &mut RollingBuffer, pts_us: i64, size: usize) {
         buf.push_frame(vec![0xBB; size], pts_us, 0);
+    }
+
+    fn push_audio(buf: &mut RollingBuffer, pts_us: i64, size: usize) {
+        buf.push_audio_frame(vec![0xCC; size], pts_us, 0);
     }
 
     #[test]
@@ -442,5 +546,41 @@ mod tests {
             "Duration {}ms exceeds expected max after config update",
             status.duration_ms
         );
+    }
+
+    #[test]
+    fn test_audio_buffering_and_export() {
+        let mut buf = RollingBuffer::new(Config::new(60));
+
+        // Push video & audio codec config
+        buf.push_frame(vec![0x00; 32], 0, BUFFER_FLAG_CODEC_CONFIG);
+        buf.push_audio_frame(vec![0x12, 0x10], 0, BUFFER_FLAG_CODEC_CONFIG);
+        assert!(buf.audio_codec_config().is_some());
+
+        // Video starts at t=1,000,000 (1s)
+        push_keyframe(&mut buf, 1_000_000, 5000);
+        for i in 1..30 {
+            push_regular(&mut buf, 1_000_000 + i * 33_333, 1000);
+        }
+
+        // Audio frames: some before video start (should be excluded), some during video
+        push_audio(&mut buf, 500_000, 200); // before video start
+        push_audio(&mut buf, 1_000_000, 200); // matches video start
+        push_audio(&mut buf, 1_050_000, 200);
+        push_audio(&mut buf, 1_100_000, 200);
+
+        push_keyframe(&mut buf, 2_000_000, 5000);
+        push_audio(&mut buf, 2_000_000, 200);
+
+        let snap = buf.snapshot_for_export(60);
+        assert_eq!(snap.total_audio_frames(), 4); // 500_000 is filtered out!
+        assert!(snap.audio_codec_config().is_some());
+
+        // Verify audio timestamp is aligned with video base_pts (1_000_000)
+        let (_, audio_pts, _) = snap.get_audio_frame(0).unwrap();
+        assert_eq!(audio_pts, 0); // 1_000_000 - 1_000_000 = 0
+
+        let (_, audio_pts_1, _) = snap.get_audio_frame(1).unwrap();
+        assert_eq!(audio_pts_1, 50_000); // 1_050_000 - 1_000_000 = 50_000
     }
 }

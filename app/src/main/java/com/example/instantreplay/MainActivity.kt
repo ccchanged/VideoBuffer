@@ -1,10 +1,12 @@
 package com.example.instantreplay
 
+import android.Manifest
 import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.os.IBinder
@@ -18,6 +20,7 @@ import androidx.core.content.ContextCompat
 import com.example.instantreplay.bridge.NativeBridge
 import com.example.instantreplay.recording.DebugLogger
 import com.example.instantreplay.recording.ReplayExporter
+import com.example.instantreplay.recording.StorageGuard
 import com.example.instantreplay.service.RecordingService
 import com.example.instantreplay.ui.MainScreen
 import com.example.instantreplay.ui.RecordingSettings
@@ -34,6 +37,7 @@ class MainActivity : ComponentActivity() {
         private const val KEY_FPS_IDX = "fps_index"
         private const val KEY_BITRATE_IDX = "bitrate_index"
         private const val KEY_DURATION_IDX = "duration_index"
+        private const val KEY_INTERNAL_AUDIO = "internal_audio"
     }
 
     // State.
@@ -43,6 +47,7 @@ class MainActivity : ComponentActivity() {
     private var exportMessage = mutableStateOf<String?>(null)
     private var showSettings = mutableStateOf(false)
     private var settings = mutableStateOf(RecordingSettings())
+    private var internalAudio = mutableStateOf(false)
     private var regularLogging = mutableStateOf(false)
     private var debugLogging = mutableStateOf(false)
 
@@ -64,9 +69,16 @@ class MainActivity : ComponentActivity() {
                 isRecording.value = false
                 exportMessage.value = "Error: $msg"
             }
+            service.onExportStateChanged = { exporting, msg ->
+                isExporting.value = exporting
+                if (msg != null) {
+                    exportMessage.value = msg
+                }
+            }
 
             // Sync state if service was already running.
             isRecording.value = service.isRecordingActive()
+            isExporting.value = service.isExporting
             if (isRecording.value) startBufferPolling()
         }
 
@@ -88,6 +100,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Audio permission launcher for Internal Audio capture.
+    private val audioPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            launchScreenCapture()
+        } else {
+            Log.w(TAG, "RECORD_AUDIO permission denied")
+            Toast.makeText(this, "Audio permission is required for Internal Audio", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -103,6 +127,7 @@ class MainActivity : ComponentActivity() {
                 val message by exportMessage
                 val settingsVisible by showSettings
                 val currentSettings by settings
+                val audioEnabled by internalAudio
                 val regularEnabled by regularLogging
                 val debugEnabled by debugLogging
 
@@ -110,11 +135,16 @@ class MainActivity : ComponentActivity() {
                     SettingsScreen(
                         settings = currentSettings,
                         isRecording = recording,
+                        internalAudio = audioEnabled,
                         regularLogging = regularEnabled,
                         debugLogging = debugEnabled,
                         onSettingsChanged = { newSettings ->
                             settings.value = newSettings
                             saveSettings(newSettings)
+                        },
+                        onInternalAudioChanged = { enabled ->
+                            internalAudio.value = enabled
+                            saveInternalAudio(enabled)
                         },
                         onRegularLoggingChanged = { enabled ->
                             regularLogging.value = enabled
@@ -132,7 +162,7 @@ class MainActivity : ComponentActivity() {
                         isRecording = recording,
                         isExporting = exporting,
                         bufferDurationMs = duration,
-                        onStartRecording = { requestScreenCapture() },
+                        onStartRecording = { onStartRecordingClicked() },
                         onStopRecording = { stopRecording() },
                         onSaveReplay = { saveReplay() },
                         onOpenSettings = { showSettings.value = true },
@@ -158,7 +188,33 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requestScreenCapture() {
+    private fun onStartRecordingClicked() {
+        // 1. Smart Low-Storage Guard: Minimum 1 GB free space required.
+        if (!StorageGuard.hasSufficientStorage(this)) {
+            val freeMb = StorageGuard.getAvailableBytes(this) / (1024 * 1024)
+            val msg = "Insufficient storage: only ${freeMb} MB free (minimum 1 GB required)."
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            exportMessage.value = msg
+            return
+        }
+
+        // 2. Check RECORD_AUDIO permission if Internal Audio is enabled.
+        if (internalAudio.value) {
+            val hasAudioPermission = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+
+            if (!hasAudioPermission) {
+                audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                return
+            }
+        }
+
+        launchScreenCapture()
+    }
+
+    private fun launchScreenCapture() {
         val projManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         projectionLauncher.launch(projManager.createScreenCaptureIntent())
     }
@@ -174,6 +230,7 @@ class MainActivity : ComponentActivity() {
             putExtra(RecordingService.EXTRA_FPS, s.fps)
             putExtra(RecordingService.EXTRA_BITRATE, s.bitrate)
             putExtra(RecordingService.EXTRA_MAX_DURATION, s.durationSec)
+            putExtra(RecordingService.EXTRA_INTERNAL_AUDIO, internalAudio.value)
         }
         ContextCompat.startForegroundService(this, intent)
 
@@ -188,35 +245,89 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopRecording() {
-        val intent = Intent(this, RecordingService::class.java).apply {
-            action = RecordingService.ACTION_STOP
+        if (isExporting.value) return
+        val s = settings.value
+        val service = recordingService
+        val duration = bufferDurationMs.longValue
+        if (duration > 0L) {
+            isExporting.value = true
+            exportMessage.value = "Saving replay…"
+            if (service != null && serviceBound) {
+                service.stopAndSave(
+                    durationSec = s.durationSec,
+                    width = s.width,
+                    height = s.height
+                ) { path ->
+                    runOnUiThread {
+                        isRecording.value = false
+                        isExporting.value = false
+                        bufferDurationMs.longValue = 0L
+                        exportMessage.value = if (path != null) {
+                            "Saved: $path"
+                        } else {
+                            "Export failed"
+                        }
+                    }
+                }
+            } else {
+                val intent = Intent(this, RecordingService::class.java).apply {
+                    action = RecordingService.ACTION_STOP
+                    putExtra(RecordingService.EXTRA_SAVE_REPLAY, true)
+                    putExtra(RecordingService.EXTRA_WIDTH, s.width)
+                    putExtra(RecordingService.EXTRA_HEIGHT, s.height)
+                    putExtra(RecordingService.EXTRA_MAX_DURATION, s.durationSec)
+                }
+                startService(intent)
+                isRecording.value = false
+                bufferDurationMs.longValue = 0L
+            }
+        } else {
+            val intent = Intent(this, RecordingService::class.java).apply {
+                action = RecordingService.ACTION_STOP
+                putExtra(RecordingService.EXTRA_SAVE_REPLAY, false)
+            }
+            startService(intent)
+            isRecording.value = false
+            bufferDurationMs.longValue = 0L
         }
-        startService(intent)
-        isRecording.value = false
-        bufferDurationMs.longValue = 0L
     }
 
     private fun saveReplay() {
         if (isExporting.value) return
-        isExporting.value = true
-        exportMessage.value = "Exporting…"
-
         val s = settings.value
-        val ctx = applicationContext
-
-        thread {
-            val path = ReplayExporter.export(
-                context = ctx,
+        val service = recordingService
+        if (service != null && serviceBound) {
+            service.saveReplay(
                 durationSec = s.durationSec,
                 width = s.width,
-                height = s.height,
-            )
-            runOnUiThread {
-                isExporting.value = false
-                exportMessage.value = if (path != null) {
-                    "Saved: $path"
-                } else {
-                    "Export failed"
+                height = s.height
+            ) { path ->
+                runOnUiThread {
+                    exportMessage.value = if (path != null) {
+                        "Saved: $path"
+                    } else {
+                        "Export failed"
+                    }
+                }
+            }
+        } else {
+            isExporting.value = true
+            exportMessage.value = "Exporting…"
+            val ctx = applicationContext
+            thread {
+                val path = ReplayExporter.export(
+                    context = ctx,
+                    durationSec = s.durationSec,
+                    width = s.width,
+                    height = s.height,
+                )
+                runOnUiThread {
+                    isExporting.value = false
+                    exportMessage.value = if (path != null) {
+                        "Saved: $path"
+                    } else {
+                        "Export failed"
+                    }
                 }
             }
         }
@@ -246,6 +357,7 @@ class MainActivity : ComponentActivity() {
             bitrateIndex = prefs.getInt(KEY_BITRATE_IDX, 2),
             durationIndex = prefs.getInt(KEY_DURATION_IDX, 2),
         )
+        internalAudio.value = prefs.getBoolean(KEY_INTERNAL_AUDIO, false)
     }
 
     private fun saveSettings(s: RecordingSettings) {
@@ -254,6 +366,13 @@ class MainActivity : ComponentActivity() {
             putInt(KEY_FPS_IDX, s.fpsIndex)
             putInt(KEY_BITRATE_IDX, s.bitrateIndex)
             putInt(KEY_DURATION_IDX, s.durationIndex)
+            apply()
+        }
+    }
+
+    private fun saveInternalAudio(enabled: Boolean) {
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().apply {
+            putBoolean(KEY_INTERNAL_AUDIO, enabled)
             apply()
         }
     }
