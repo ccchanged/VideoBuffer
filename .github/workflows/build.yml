@@ -47,6 +47,13 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+          cache-overwrite-existing: true
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
@@ -94,17 +101,8 @@ jobs:
         working-directory: rust/replay_core
         run: cargo ndk -t arm64-v8a -o ../../app/src/main/jniLibs build --release
 
-      - name: Generate Gradle wrapper
-        run: |
-          gradle wrapper --gradle-version=8.9
-
-      - name: Setup Gradle (with cache)
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
-
       - name: Build release APK
-        run: ./gradlew assembleRelease --build-cache
+        run: gradle assembleRelease --build-cache
 
       - name: Upload release APK
         uses: actions/upload-artifact@v4
