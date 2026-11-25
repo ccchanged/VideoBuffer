@@ -69,18 +69,26 @@ jobs:
         with:
           targets: aarch64-linux-android
 
+      - name: Cache cargo-ndk binary
+        id: cache-cargo-ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-ndk
+          key: ${{ runner.os }}-cargo-ndk-v3
+
       - name: Install cargo-ndk
+        if: steps.cache-cargo-ndk.outputs.cache-hit != 'true'
         run: cargo install cargo-ndk
 
-      - name: Cache Rust
+      - name: Cache Rust dependencies & build artifacts
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             rust/replay_core/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/replay_core/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('rust/replay_core/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-arm64-
 
       - name: Build Rust native library
         working-directory: rust/replay_core
@@ -90,11 +98,13 @@ jobs:
         run: |
           gradle wrapper --gradle-version=8.9
 
-      - name: Setup Gradle
+      - name: Setup Gradle (with cache)
         uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
 
       - name: Build release APK
-        run: ./gradlew assembleRelease --no-daemon
+        run: ./gradlew assembleRelease --build-cache
 
       - name: Upload release APK
         uses: actions/upload-artifact@v4
